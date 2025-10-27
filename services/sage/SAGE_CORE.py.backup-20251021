@@ -1,0 +1,491 @@
+"""
+IFP Sage - Production-Ready Edge Monitoring with O2 Integration
+
+Combines simple synchronous operation with production features:
+- Prometheus metrics collection
+- O2 wallet rules engine
+- Slack alerting
+- Control API monitoring
+"""
+from fastapi import FastAPI
+from pydantic import BaseModel
+import os
+import time
+import requests
+import logging
+from typing import Dict, List, Any
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+CONTROL_API = os.getenv("CONTROL_API", "http://control-api:8000")
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+INTERVAL_S = int(os.getenv("SAGE_INTERVAL_S", "30"))
+O2_MONITORING_ENABLED = os.getenv("O2_MONITORING_ENABLED", "true").lower() == "true"
+
+app = FastAPI(title="IFP Sage (Production Edge)", version="1.0.0")
+
+
+class Health(BaseModel):
+    status: str
+    mode: str
+    interval_s: int
+    o2_monitoring: bool = False
+    prometheus_enabled: bool = False
+    slack_enabled: bool = False
+
+
+@app.get("/health", response_model=Health)
+def health():
+    return Health(
+        status="ok",
+        mode="production-edge",
+        interval_s=INTERVAL_S,
+        o2_monitoring=O2_MONITORING_ENABLED,
+        prometheus_enabled=bool(PROMETHEUS_URL),
+        slack_enabled=bool(SLACK_WEBHOOK_URL)
+    )
+
+
+# ============================================================================
+# PROMETHEUS INTEGRATION (from reference architecture)
+# ============================================================================
+
+def _prom(promql: str, timeout: int = 5) -> List[Dict]:
+    """Query Prometheus instant vector API."""
+    if not PROMETHEUS_URL:
+        return []
+
+    try:
+        r = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query",
+            params={"query": promql},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") != "success":
+            logger.warning(f"PromQL not success: {data}")
+            return []
+        return data["data"]["result"]
+    except Exception as e:
+        logger.error(f"Prometheus query error: {e}")
+        return []
+
+
+def _collect_o2_wallets() -> Dict[str, Dict]:
+    """Read o2_wallet_balance from Prometheus and map to services dict"""
+    services = {}
+    results = _prom('o2_wallet_balance')
+
+    for vec in results:
+        labels = vec.get("metric", {})
+        wallet = labels.get("wallet", "0x638C70f337fc63DB0E108308E3dD60f71eb97342")
+
+        value_str = vec.get("value", ["0", "0"])[1]
+        try:
+            balance = float(value_str)
+        except Exception:
+            balance = 0
+
+        service_id = f"o2-wallet"
+        services[service_id] = {
+            "wallet_address": wallet,
+            "balance": balance,
+            "status": "degraded" if balance == 0 else "healthy",
+        }
+
+    return services
+
+
+def _merge_services(base: Dict[str, Dict], extra: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Merge two service dicts without overwriting"""
+    merged = dict(base)
+    for k, v in extra.items():
+        merged[k] = {**merged.get(k, {}), **v}
+    return merged
+
+
+# ============================================================================
+# O2 RULES ENGINE (from reference architecture)
+# ============================================================================
+
+# Rule definitions (simplified from full O2 rules)
+O2_RULES = [
+    {
+        "id": "o2_low_balance",
+        "desc": "O2 wallet balance critically low",
+        "predicate": {
+            "field": "balance",
+            "op": "<",
+            "threshold": 10000
+        },
+        "severity": "warning",
+        "action": "alert"
+    },
+    {
+        "id": "o2_zero_balance",
+        "desc": "O2 wallet balance is zero",
+        "predicate": {
+            "field": "balance",
+            "op": "==",
+            "threshold": 0
+        },
+        "severity": "critical",
+        "action": "alert"
+    },
+    {
+        "id": "o2_service_down",
+        "desc": "O2 wallet service unreachable",
+        "predicate": {
+            "field": "status",
+            "op": "==",
+            "threshold": "degraded"
+        },
+        "severity": "error",
+        "action": "alert"
+    }
+]
+
+
+def _eval_o2_rules(services: Dict[str, Dict]) -> List[Dict]:
+    """
+    Evaluate O2 rules against current services state
+
+    Returns list of insights with fired rules
+    """
+    logger.info(f"=== DEBUG: _eval_o2_rules called ===")
+    logger.info(f"Total services in state: {len(services)}")
+    logger.info(f"Service keys: {list(services.keys())}")
+
+    insights = []
+
+    # Extract O2 services
+    o2_services = {
+        svc: data for svc, data in services.items()
+        if svc.startswith("o2-wallet")
+    }
+
+    logger.info(f"O2 services extracted: {len(o2_services)}")
+    logger.info(f"O2 service keys: {list(o2_services.keys())}")
+
+    if o2_services:
+        for svc, data in o2_services.items():
+            logger.info(f"O2 service [{svc}]: {data}")
+
+    if not o2_services:
+        logger.warning("No O2 services found to evaluate!")
+        return insights
+
+    for rule in O2_RULES:
+        rid = rule.get("id")
+        pred = rule.get("predicate", {})
+        field = pred.get("field")
+        op = pred.get("op")
+        threshold = pred.get("threshold")
+        severity = rule.get("severity", "info")
+
+        logger.info(f"Evaluating rule: {rid}")
+        logger.info(f"  Field: {field}, Op: {op}, Threshold: {threshold}")
+
+        fired = []
+
+        for svc, data in o2_services.items():
+            value = data.get(field)
+            logger.info(f"  Service {svc}: {field}={value}")
+
+            if value is None:
+                logger.info(f"    Skipping - field '{field}' not found")
+                continue
+
+            # Evaluate predicate
+            condition = False
+            if op == "<" and isinstance(value, (int, float)):
+                condition = value < threshold
+                logger.info(f"    Checking: {value} < {threshold} = {condition}")
+            elif op == ">" and isinstance(value, (int, float)):
+                condition = value > threshold
+                logger.info(f"    Checking: {value} > {threshold} = {condition}")
+            elif op == "==":
+                condition = value == threshold
+                logger.info(f"    Checking: {value} == {threshold} = {condition}")
+
+            if condition:
+                fired.append(svc)
+                logger.info(f"    ⚠️  Rule {rid} FIRED for {svc}")
+
+        if fired:
+            logger.info(f"✅ Rule {rid} fired for {len(fired)} service(s): {fired}")
+            insights.append({
+                "rule_id": rid,
+                "description": rule.get("desc"),
+                "severity": severity,
+                "affected_services": fired[:20],  # Limit to 20
+                "confidence": 0.95,
+                "action": rule.get("action", "log")
+            })
+
+    return insights
+
+
+# ============================================================================
+# SLACK INTEGRATION (from reference architecture)
+# ============================================================================
+
+def _slack_post(text: str, timeout: int = 4) -> bool:
+    """Post alert to Slack webhook"""
+    if not SLACK_WEBHOOK_URL:
+        logger.debug("SLACK_WEBHOOK_URL not set; skipping Slack post.")
+        return False
+
+    try:
+        r = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": text},
+            timeout=timeout,
+        )
+        if r.status_code >= 400:
+            logger.error(f"Slack webhook error {r.status_code}: {r.text}")
+            return False
+        logger.info("✅ Slack alert sent")
+        return True
+    except Exception as e:
+        logger.error(f"Slack post failed: {e}")
+        return False
+
+
+# ============================================================================
+# OBSERVE / REFLECT / ACT LOOP
+# ============================================================================
+
+def observe():
+    """
+    👁️  OBSERVE: Gather system telemetry
+
+    Combines:
+    - Control API health
+    - O2 wallet metrics from Prometheus
+    - O2 wallet service status
+    """
+    observations = {
+        "services": {},
+        "timestamp": time.time()
+    }
+
+    # Check Control API
+    try:
+        r = requests.get(f"{CONTROL_API}/health", timeout=3)
+        r.raise_for_status()
+        observations["control_api"] = "up"
+        observations["control_payload"] = r.json()
+    except Exception as e:
+        observations["control_api"] = "down"
+        observations["control_error"] = str(e)
+        logger.error(f"Control API down: {e}")
+
+    # Collect O2 wallet metrics from Prometheus
+    if O2_MONITORING_ENABLED:
+        try:
+            logger.info("=== DEBUG: Collecting O2 wallets from Prometheus ===")
+            o2_services = _collect_o2_wallets()
+            logger.info(f"O2 services from Prometheus: {len(o2_services)}")
+            logger.info(f"O2 service keys: {list(o2_services.keys())}")
+
+            for svc, data in o2_services.items():
+                logger.info(f"  {svc}: {data}")
+
+            logger.info("=== DEBUG: Merging services ===")
+            logger.info(f"Before merge - services count: {len(observations['services'])}")
+
+            observations["services"] = _merge_services(observations["services"], o2_services)
+
+            logger.info(f"After merge - services count: {len(observations['services'])}")
+            o2_count = sum(1 for k in observations["services"].keys() if k.startswith('o2-wallet'))
+            logger.info(f"O2 wallets in merged services: {o2_count}")
+
+            if o2_count > 0:
+                o2_keys = [k for k in observations["services"].keys() if k.startswith('o2-wallet')]
+                logger.info(f"O2 wallet keys after merge: {o2_keys}")
+                for key in o2_keys[:1]:  # Show first one
+                    logger.info(f"Sample O2 service [{key}]: {observations['services'][key]}")
+
+        except Exception as e:
+            logger.error(f"O2 Prometheus collection failed: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+    # Fallback: Direct O2 API check if Prometheus has no data
+    if not observations["services"] and O2_MONITORING_ENABLED:
+        try:
+            from o2_monitor import observe_o2
+            o2_obs = observe_o2()
+
+            # Convert to services format
+            observations["services"]["o2-wallet"] = {
+                "status": o2_obs.get("status", "unknown"),
+                "balance": o2_obs.get("balance", 0),
+                "issues": o2_obs.get("issues", [])
+            }
+            logger.debug("Using direct O2 API (Prometheus fallback)")
+        except Exception as e:
+            logger.error(f"O2 direct monitoring failed: {e}")
+
+    return observations
+
+
+def reflect(state: Dict) -> Dict:
+    """
+    🧠 REFLECT: Analyze system state and generate insights
+
+    Calculates:
+    - Coherence score
+    - O2 rule evaluations
+    - Actionable insights
+    """
+    insights = {
+        "control_coherence": 1.0 if state.get("control_api") == "up" else 0.0,
+        "o2_insights": [],
+        "recommendations": []
+    }
+
+    # Evaluate O2 rules
+    if O2_MONITORING_ENABLED and state.get("services"):
+        try:
+            o2_insights = _eval_o2_rules(state["services"])
+            insights["o2_insights"] = o2_insights
+
+            # Add to recommendations
+            for insight in o2_insights:
+                insights["recommendations"].append({
+                    "rule": insight["rule_id"],
+                    "action": insight["action"],
+                    "severity": insight["severity"],
+                    "description": insight["description"]
+                })
+
+            logger.debug(f"O2 rules fired: {len(o2_insights)}")
+        except Exception as e:
+            logger.error(f"O2 rule evaluation failed: {e}")
+
+    # Calculate overall coherence
+    if insights["o2_insights"]:
+        # Reduce coherence for each fired rule
+        penalty = len(insights["o2_insights"]) * 0.1
+        insights["coherence"] = max(0.0, insights["control_coherence"] - penalty)
+    else:
+        insights["coherence"] = insights["control_coherence"]
+
+    return insights
+
+
+def act(insights: Dict):
+    """
+    ⚡ ACT: Execute automated actions based on insights
+
+    Actions:
+    - Log recommendations
+    - Send Slack alerts
+    - Report to Control API
+    """
+    try:
+        # Report heartbeat to Control API
+        requests.post(
+            f"{CONTROL_API}/alerts/ingest",
+            json={
+                "type": "sage_heartbeat",
+                "insights": insights,
+                "timestamp": time.time()
+            },
+            timeout=2
+        )
+    except Exception:
+        pass  # Non-critical
+
+    # Process O2 insights
+    for insight in insights.get("o2_insights", []):
+        severity = insight["severity"].upper()
+        description = insight["description"]
+        services = ", ".join(insight["affected_services"])
+
+        # Log the insight
+        log_msg = f"[{severity}] {description} - Affected: {services}"
+
+        if severity == "CRITICAL":
+            logger.critical(log_msg)
+        elif severity == "ERROR":
+            logger.error(log_msg)
+        elif severity == "WARNING":
+            logger.warning(log_msg)
+        else:
+            logger.info(log_msg)
+
+        # Send Slack alert for warnings and above
+        if insight["action"] == "alert" and severity in ["WARNING", "ERROR", "CRITICAL"]:
+            slack_msg = f"🚨 *IFP Sage Alert*\n\n" \
+                       f"*Severity:* {severity}\n" \
+                       f"*Rule:* {insight['rule_id']}\n" \
+                       f"*Description:* {description}\n" \
+                       f"*Affected Services:* {services}\n" \
+                       f"*Confidence:* {insight['confidence']*100:.0f}%"
+
+            _slack_post(slack_msg)
+
+
+# ============================================================================
+# MAIN LOOP
+# ============================================================================
+
+if __name__ == "__main__":
+    import threading
+    import uvicorn
+
+    logger.info("🚀 Starting IFP Sage (Production Edge)")
+    logger.info(f"   Control API: {CONTROL_API}")
+    logger.info(f"   Prometheus: {PROMETHEUS_URL}")
+    logger.info(f"   O2 Monitoring: {O2_MONITORING_ENABLED}")
+    logger.info(f"   Slack Alerts: {'Enabled' if SLACK_WEBHOOK_URL else 'Disabled'}")
+    logger.info(f"   Interval: {INTERVAL_S}s")
+
+    def loop():
+        """Background observe/reflect/act loop"""
+        loop_count = 0
+        while True:
+            try:
+                loop_count += 1
+                logger.info(f"\n{'='*60}")
+                logger.info(f"👁️  OBSERVE (Loop #{loop_count}): Gathering system telemetry...")
+
+                state = observe()
+
+                logger.info(f"   Control API: {state.get('control_api')}")
+                logger.info(f"   Services: {len(state.get('services', {}))}")
+
+                logger.info(f"🧠 REFLECT: Analyzing system state...")
+                insights = reflect(state)
+
+                logger.info(f"   Coherence: {insights.get('coherence', 0):.2f}")
+                logger.info(f"   O2 Insights: {len(insights.get('o2_insights', []))}")
+
+                if insights.get("o2_insights"):
+                    logger.info(f"⚡ ACT: Executing automated actions...")
+                    act(insights)
+                else:
+                    logger.info(f"✅ No actions needed - system healthy")
+
+                time.sleep(INTERVAL_S)
+
+            except Exception as e:
+                logger.exception(f"Error in Sage loop: {e}")
+                time.sleep(5)
+
+    # Start background loop
+    threading.Thread(target=loop, daemon=True).start()
+
+    # Start FastAPI server
+    uvicorn.run(app, host="0.0.0.0", port=8055)

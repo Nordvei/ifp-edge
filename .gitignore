@@ -1,0 +1,88 @@
+# IFP Edge - Git Ignore
+
+# Environment files
+.env
+.env.local
+.env.*.local
+*.env.backup
+
+# Docker volumes and data
+prometheus_data/
+grafana_data/
+postgres_data/
+redis_data/
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Secrets and credentials
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+service-account.json
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Test coverage
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Documentation builds
+docs/_build/
+site/
